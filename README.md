@@ -66,7 +66,7 @@ API_KEY=somekey
 Для отправки сообщений через API:
 
 ```bash
-curl -X POST http://localhost:3002/api/messages \
+curl -X POST http://localhost:3000/api/messages \
   -H "X-API-Key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -181,6 +181,10 @@ eventSource.addEventListener('error', () => {
 ```
 
 Вы можете фильтровать поток по `chatId` или `source` (например, `telegram` или `instagram`).
+
+## Todo
+- Перейти на официальный WhatsApp Cloud API, а также Instagram API
+- Избавиться от pocketbase в пользу встроенного в bun sqlite или postgresql
 
 ## Лицензия
 
