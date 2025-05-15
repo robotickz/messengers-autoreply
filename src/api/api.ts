@@ -3,7 +3,7 @@ import { cors } from 'hono/cors'
 import { serve } from 'bun';
 import { sendTelegramMessage } from '../receiver/telegram';
 import { processAgentMessage, processBrevoMessage, sendBrevoMessage } from '../receiver/brevo';
-import { getChatById, getChats, pb, handleAuthError } from '../storage/pocketbase';
+import { getChatById, getChats, pb, refreshAuthentication } from '../storage/pocketbase';
 import { streamSSE } from 'hono/streaming';
 import dotenv from 'dotenv';
 import { Message } from '../models';
@@ -26,7 +26,7 @@ setInterval(() => {
 }, 600000);
 
 app.use('*', cors({
-  origin: ['http://localhost:3000', process.env.CORS_ORIGIN_REMOTE!],
+  origin: ['http://localhost:3000', corsUrl!],
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
   exposeHeaders: ['Content-Length'],
@@ -177,7 +177,8 @@ app.get('/api/chats', async (c) => {
     });
   } catch (error: any) {
     console.error('Error fetching chats:', error);
-    if (error.status === 403 && await handleAuthError(error)) {
+    if (error.status === 403) {
+      await refreshAuthentication();
       try {
         const limit = Number(c.req.query('limit')) || 50;
         const source = c.req.query('source');
@@ -231,7 +232,8 @@ app.get('/api/chats/:chatId/messages', async (c) => {
       });
     } catch (messagesError: any) {
       // Проверяем, нужна ли повторная аутентификация
-      if (messagesError.status === 403 && await handleAuthError(messagesError)) {
+      if (messagesError.status === 403) {
+        await refreshAuthentication();
         const messages = await pb.collection('messages').getList(1, limit, {
           filter: `chatId="${chatId}"`,
           sort: 'timestamp'
@@ -280,7 +282,8 @@ app.patch('/api/chats/:chatId/autoMode', async (c) => {
         autoMode: body.autoMode
       });
     } catch (updateError: any) {
-      if (updateError.status === 403 && await handleAuthError(updateError)) {
+      if (updateError.status === 403) {
+        await refreshAuthentication();
         await pb.collection('chats').update(chatId, {
           autoMode: body.autoMode
         });
@@ -331,7 +334,8 @@ app.get('/api/stream', async (c) => {
           });
         });
       } catch (error: any) {
-        if (error.status === 403 && await handleAuthError(error)) {
+        if (error.status === 403) {
+          await refreshAuthentication();
           unsubscribeChats = await pb.collection('chats').subscribe('*', async (data) => {
             if (source && data.record.source !== source) return;
 
@@ -368,7 +372,8 @@ app.get('/api/stream', async (c) => {
           });
         });
       } catch (error: any) {
-        if (error.status === 403 && await handleAuthError(error)) {
+        if (error.status === 403) {
+          await refreshAuthentication();
           unsubscribeMessages = await pb.collection('messages').subscribe(messageFilter, async (data) => {
             if (chatId && data.record.chatId !== chatId) return;
 
