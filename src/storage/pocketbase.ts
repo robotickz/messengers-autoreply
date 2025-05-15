@@ -4,7 +4,6 @@ import { Message, Chat, MessageSource } from '../models';
 
 const EMAIL = process.env.POCKET_BASE_EMAIL;
 const PASSWORD = process.env.POCKET_BASE_PASSWORD;
-let authRetryInProgress = false;
 
 export const pb = new PocketBase(process.env.POCKETBASE_URL);
 
@@ -27,21 +26,13 @@ export async function authenticate(email: string = EMAIL!, password: string = PA
   }
 }
 
-export async function handleAuthError(error: any) {
-  if (error?.status === 403 && error?.response?.message?.includes("perform this action") && !authRetryInProgress) {
-    try {
-      authRetryInProgress = true;
-      console.log('PocketBase: Auth token expired, attempting re-authentication');
-      await authenticate(EMAIL!, PASSWORD!, true);
-      authRetryInProgress = false;
-      return true;
-    } catch (authError) {
-      console.error('PocketBase: Re-authentication failed', authError);
-      authRetryInProgress = false;
-      return false;
-    }
+export async function refreshAuthentication() {
+  if (pb.authStore.isValid) {
+    await pb.collection('_superusers').authRefresh();
+  } else {
+    await pb.authStore.clear();
+    await authenticate();
   }
-  return false;
 }
 
 export async function saveMessage(msg: Message): Promise<Message> {
@@ -90,9 +81,10 @@ export async function getMessageById(platformMessageId: string, senderId: string
     const result = await pb.collection('messages').getFirstListItem(`platformMessageId="${platformMessageId}" && senderId="${senderId}"`);
     return result.id;
   }
-  
+
   catch (err: any) {
-    if (err.status === 403 && await handleAuthError(err)) {
+    if (err.status === 403) {
+      await authenticate();
       return getMessageById(platformMessageId, senderId);
     }
     if (err.status === 400 || err.status === 404) {
@@ -122,7 +114,8 @@ export async function saveChat(chat: Chat): Promise<Chat> {
       autoMode: result.autoMode
     };
   } catch (err: any) {
-    if (err.status === 403 && await handleAuthError(err)) {
+    if (err.status === 403) {
+      await refreshAuthentication();
       return saveChat(chat);
     }
     if (err.status === 400 || err.status === 404) {
@@ -160,7 +153,8 @@ export async function findOrCreateChat(
       };
 
     } catch (err: any) {
-      if (err.status === 403 && await handleAuthError(err)) {
+      if (err.status === 403) {
+        await refreshAuthentication();
         return findOrCreateChat(id, source, name);
       }
       if (err.status === 400 || err.status === 404) {
@@ -201,8 +195,9 @@ export async function getChats(source: string, limit: number): Promise<any> {
     return chats;
 
   } catch (error: any) {
-    if (error.status === 403 && await handleAuthError(error)) {
-        return getChats(source, limit);
+    if (error.status === 403) {
+      await refreshAuthentication();
+      return getChats(source, limit);
     }
     throw error;
   }
@@ -212,7 +207,8 @@ export async function getChatById(chatId: string): Promise<any> {
   try {
     return await pb.collection('chats').getOne(chatId);
   } catch (error: any) {
-     if (error.status === 403 && await handleAuthError(error)) {
+    if (error.status === 403) {
+      await refreshAuthentication();
       return getChatById(chatId);
     }
     console.error(`Failed to get chat: ${chatId}`);
