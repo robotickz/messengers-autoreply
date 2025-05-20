@@ -1,11 +1,12 @@
 import PocketBase, { FileOptions, RecordModel } from 'pocketbase';
 import { Message, Chat, MessageSource } from '../models';
 
+const EMAIL = process.env.POCKETBASE_EMAIL;
+const PASSWORD = process.env.POCKETBASE_PASSWORD;
+const URL = process.env.POCKETBASE_URL;
 
-const EMAIL = process.env.POCKET_BASE_EMAIL;
-const PASSWORD = process.env.POCKET_BASE_PASSWORD;
 
-export const pb = new PocketBase(process.env.POCKETBASE_URL);
+export const pb = new PocketBase(URL);
 
 export async function authenticate(email: string = EMAIL!, password: string = PASSWORD!, silent: boolean = false) {
   try {
@@ -27,9 +28,14 @@ export async function authenticate(email: string = EMAIL!, password: string = PA
 }
 
 export async function refreshAuthentication() {
-  if (pb.authStore.isValid) {
-    await pb.collection('_superusers').authRefresh();
-  } else {
+  try {
+    if (pb.authStore.isValid) {
+      await pb.collection('_superusers').authRefresh();
+    } else {
+      await pb.authStore.clear();
+      await authenticate();
+    }
+  } catch (error) {
     await pb.authStore.clear();
     await authenticate();
   }

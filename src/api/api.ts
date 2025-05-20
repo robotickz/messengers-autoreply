@@ -1,21 +1,24 @@
 import { Hono } from 'hono';
-import { cors } from 'hono/cors'
-import { serve } from 'bun';
+import { cors } from 'hono/cors';
 import { sendTelegramMessage } from '../receiver/telegram';
 import { processAgentMessage, processBrevoMessage, sendBrevoMessage } from '../receiver/brevo';
-import { getChatById, getChats, pb, refreshAuthentication } from '../storage/pocketbase';
-import { streamSSE } from 'hono/streaming';
+import { getChatById, getChats, getFileToken, getFileUrl, getMediaRecord, pb, refreshAuthentication } from '../storage/pocketbase';
+import { Message, MessageSource } from '../models';
+import { serve } from 'bun';
+
 import dotenv from 'dotenv';
-import { Message } from '../models';
+
 
 dotenv.config();
 
 const app = new Hono();
 const API_KEY = process.env.API_KEY;
-const PORT = process.env.SERVER_PORT || 3000;
+const PORT = parseInt(process.env.SERVER_PORT || '3000');
 const processedMessages = new Map<string, number>();
 const corsUrl = process.env.CORS_ORIGIN_REMOTE;
+const hookSecret = process.env.BREVO_WEBHOOK_SECRET;
 
+// Очистка старых обработанных сообщений
 setInterval(() => {
   const now = Date.now();
   for (const [id, timestamp] of processedMessages.entries()) {
@@ -45,7 +48,7 @@ async function authMiddleware(c: any, next: any) {
 }
 
 app.use('*', async (c, next) => {
-  if (c.req.path === '/health' || c.req.path === '/brevohook') {
+  if (c.req.path === '/health' || c.req.path === `/brevohook/${hookSecret!}` || c.req.path.startsWith('/api/files/')) {
     return next();
   }
   return authMiddleware(c, next);
@@ -60,7 +63,7 @@ app.get('/health', (c) => {
   });
 });
 
-app.post('/brevohook', async (c) => {
+app.post(`/brevohook/${hookSecret!}`, async (c) => {
   const body = await c.req.json();
   console.log('Received webhook:', body);
 
@@ -123,10 +126,10 @@ app.post('/api/messages', async (c) => {
     }
 
     const msg: Message = {
-      source: source,
+      source: source as MessageSource,
       platformMessageId: `api_${Date.now()}`,
       chatId: chatId,
-      type: type,
+      type: type || 'text',
       content: text,
       isIncoming: false,
       timestamp: new Date(),
@@ -155,11 +158,11 @@ app.post('/api/messages', async (c) => {
       external: externalResult
     });
 
-  } catch (error) {
+  } catch (error: any) {
     console.error('Error processing message:', error);
     return c.json({
       success: false,
-      message: error || 'Internal server error'
+      message: error?.message || 'Internal server error'
     }, 500);
   }
 });
@@ -183,7 +186,7 @@ app.get('/api/chats', async (c) => {
         const limit = Number(c.req.query('limit')) || 50;
         const source = c.req.query('source');
         let chats = await getChats(source!, limit);
-        
+
         return c.json({
           success: true,
           total: chats.totalItems,
@@ -197,7 +200,7 @@ app.get('/api/chats', async (c) => {
         }, 500);
       }
     }
-    
+
     return c.json({
       success: false,
       message: error?.message || 'Failed to fetch chats'
@@ -231,7 +234,6 @@ app.get('/api/chats/:chatId/messages', async (c) => {
         messages: messages.items
       });
     } catch (messagesError: any) {
-      // Проверяем, нужна ли повторная аутентификация
       if (messagesError.status === 403) {
         await refreshAuthentication();
         const messages = await pb.collection('messages').getList(1, limit, {
@@ -306,121 +308,116 @@ app.patch('/api/chats/:chatId/autoMode', async (c) => {
   }
 });
 
-app.get('/api/stream', async (c) => {
-  const chatId = c.req.query('chatId');
-  const source = c.req.query('source');
+app.get('/api/media/:mediaFileId/url', async (c) => {
+  try {
+    const mediaFileId = c.req.param('mediaFileId');
 
-  return streamSSE(c, async (stream) => {
-    let unsubscribeChats: Function;
-    let unsubscribeMessages: Function;
+
+    if (!mediaFileId) {
+      return c.json({
+        success: false,
+        message: 'Missing required parameter: mediaFileId'
+      }, 400);
+    }
 
     try {
-      await stream.writeSSE({
-        data: JSON.stringify({ type: 'connected' }),
-        event: 'connection'
-      });
+      const fileToken = await getFileToken();
+      const mediaRecord = await getMediaRecord(mediaFileId);
 
-      try {
-        unsubscribeChats = await pb.collection('chats').subscribe('*', async (data) => {
-          if (source && data.record.source !== source) return;
-
-          await stream.writeSSE({
-            data: JSON.stringify({
-              type: 'chat',
-              action: data.action,
-              record: data.record
-            }),
-            event: 'update'
-          });
-        });
-      } catch (error: any) {
-        if (error.status === 403) {
-          await refreshAuthentication();
-          unsubscribeChats = await pb.collection('chats').subscribe('*', async (data) => {
-            if (source && data.record.source !== source) return;
-
-            await stream.writeSSE({
-              data: JSON.stringify({
-                type: 'chat',
-                action: data.action,
-                record: data.record
-              }),
-              event: 'update'
-            });
-          });
-        } else {
-          console.error('Error subscribing to chats:', error);
-          await stream.writeSSE({
-            data: JSON.stringify({ type: 'error', message: 'Failed to subscribe to chats' }),
-            event: 'error'
-          });
-        }
+      if (!mediaRecord) {
+        return c.json({
+          success: false,
+          message: `Media record with ID ${mediaFileId} not found`
+        }, 404);
       }
 
-      const messageFilter = chatId ? `chatId="${chatId}"` : '';
-      try {
-        unsubscribeMessages = await pb.collection('messages').subscribe(messageFilter, async (data) => {
-          if (chatId && data.record.chatId !== chatId) return;
+      const url = await getFileUrl(mediaRecord, mediaRecord.file, { 'token': fileToken });
+      const urlObj = new URL(url);
+      const relativePath = urlObj.pathname + urlObj.search;
 
-          await stream.writeSSE({
-            data: JSON.stringify({
-              type: 'message',
-              action: data.action,
-              record: data.record
-            }),
-            event: 'update'
-          });
-        });
-      } catch (error: any) {
-        if (error.status === 403) {
-          await refreshAuthentication();
-          unsubscribeMessages = await pb.collection('messages').subscribe(messageFilter, async (data) => {
-            if (chatId && data.record.chatId !== chatId) return;
+      return c.json({
+        success: true,
+        url: relativePath
+      });
+    } catch (mediaError: any) {
+      if (mediaError.status === 403) {
+        await refreshAuthentication();
+        const fileToken = await getFileToken();
+        const mediaRecord = await getMediaRecord(mediaFileId);
 
-            await stream.writeSSE({
-              data: JSON.stringify({
-                type: 'message',
-                action: data.action,
-                record: data.record
-              }),
-              event: 'update'
-            });
-          });
-        } else {
-          console.error('Error subscribing to messages:', error);
-          await stream.writeSSE({
-            data: JSON.stringify({ type: 'error', message: 'Failed to subscribe to messages' }),
-            event: 'error'
-          });
+        if (!mediaRecord) {
+          return c.json({
+            success: false,
+            message: `Media record with ID ${mediaFileId} not found`
+          }, 404);
         }
-      }
 
-      const keepAliveInterval = setInterval(async () => {
-        await stream.writeSSE({
-          data: JSON.stringify({ type: 'ping' }),
-          event: 'ping'
+        const url = await getFileUrl(mediaRecord, mediaRecord.file, { 'token': fileToken });
+        const urlObj = new URL(url);
+        const relativePath = urlObj.pathname + urlObj.search;
+
+        return c.json({
+          success: true,
+          url: relativePath
         });
-      }, 30000);
-
-      c.req.raw.signal.addEventListener('abort', () => {
-        clearInterval(keepAliveInterval);
-        if (unsubscribeChats) unsubscribeChats();
-        if (unsubscribeMessages) unsubscribeMessages();
-        console.log('Client disconnected from SSE stream');
-      });
-    } catch (error) {
-      console.error('SSE stream error:', error);
-      await stream.writeSSE({
-        data: JSON.stringify({ type: 'error', message: 'Stream error occurred' }),
-        event: 'error'
-      });
+      }
+      throw mediaError;
     }
-  });
+  } catch (error: any) {
+    console.error('Error getting media URL:', error);
+    return c.json({
+      success: false,
+      message: error?.message || 'Failed to get media URL'
+    }, error?.status || 500);
+  }
+});
+
+app.get('/pb-hook/:chatId', async (c) => {
+  try{
+    const id = c.req.param('chatId');
+    httpServer.publish("event", id);
+    return c.json({
+          success: true
+        });
+  }
+  catch(e){
+  }
 });
 
 const httpServer = serve({
   port: PORT,
-  fetch: app.fetch
+  fetch: (req, server) => {
+    const url = new URL(req.url);
+    if (url.pathname === '/api/ws') {
+      const apiKey = url.searchParams.get('apiKey');
+      if (apiKey !== API_KEY) {
+        return new Response('Unauthorized: Invalid API key', { status: 401 });
+      }
+
+      const chatId = url.searchParams.get('chatId');
+      const source = url.searchParams.get('source');
+
+      const success = server.upgrade(req, {
+        data: { chatId, source }
+      });
+
+      return success
+        ? undefined
+        : new Response('WebSocket upgrade failed', { status: 500 });
+    }
+
+    return app.fetch(req);
+  },
+  websocket: {
+     open(ws) {
+      ws.subscribe("event");
+    },
+    message(ws, message) {
+    },
+    close(ws) {
+      ws.unsubscribe("event");
+    },
+  }
 });
 
 export async function startRealtimeHttpServer() {
